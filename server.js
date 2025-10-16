@@ -8,9 +8,9 @@ const app = express();
 // For local development, fill these in directly:
 // For production (Render), use environment variables
 
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE || 'cableandcottonltd.myshopify.com';
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || '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';
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'sharif-secret-webhook-CC-2025';
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE || 'your-store.myshopify.com';
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || 'your-token-here';
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'your-secret-here';
 
 const PORT = process.env.PORT || 3000;
 
