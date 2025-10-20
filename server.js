@@ -10,7 +10,7 @@ const app = express();
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE || 'your-store.myshopify.com';
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || 'your-token-here';
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'your-secret-here';
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'your--here';
 
 const PORT = process.env.PORT || 3000;
 
