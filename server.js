@@ -5,12 +5,9 @@ const app = express();
 // ============================================
 // CONFIGURATION
 // ============================================
-// For local development, fill these in directly:
-// For production (Render), use environment variables
-
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE || 'your-store.myshopify.com';
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || 'your-token-here';
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'your--here';
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || 'your-secret-here';
 
 const PORT = process.env.PORT || 3000;
 
@@ -21,7 +18,7 @@ app.use(express.json({
   }
 }));
 
-// Enable CORS for your Shopify store
+// Enable CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -72,142 +69,293 @@ async function shopifyAPI(endpoint, method = 'GET', body = null) {
 }
 
 // ============================================
-// ADJUST INVENTORY
+// GET INVENTORY DETAILS
 // ============================================
-async function adjustInventory(variantId, quantity, reason = 'Bundle component deduction') {
+async function getInventoryDetails(variantId) {
   try {
-    console.log(`Adjusting inventory for variant ${variantId}: ${quantity}`);
-    
-    // First, get the inventory item ID
     const variantData = await shopifyAPI(`variants/${variantId}.json`);
     const inventoryItemId = variantData.variant.inventory_item_id;
     
-    // Get inventory levels to find the location ID
     const levelsData = await shopifyAPI(`inventory_levels.json?inventory_item_ids=${inventoryItemId}`);
     
     if (!levelsData.inventory_levels || levelsData.inventory_levels.length === 0) {
-      console.warn(`No inventory location found for variant ${variantId}`);
+      return null;
+    }
+    
+    return {
+      inventoryItemId,
+      locationId: levelsData.inventory_levels[0].location_id,
+      available: levelsData.inventory_levels[0].available || 0
+    };
+  } catch (error) {
+    console.error(`Error getting inventory details for variant ${variantId}:`, error.message);
+    return null;
+  }
+}
+
+// ============================================
+// SET INVENTORY LEVELS (for committed stock)
+// ============================================
+async function setInventoryLevel(variantId, available, reason = '') {
+  try {
+    console.log(`📊 Setting inventory for variant ${variantId}: ${available} available (${reason})`);
+    
+    const details = await getInventoryDetails(variantId);
+    if (!details) {
+      console.warn(`⚠️ No inventory location found for variant ${variantId}`);
       return;
     }
     
-    const locationId = levelsData.inventory_levels[0].location_id;
-    
-    // Adjust inventory using inventory_levels/adjust endpoint
-    await shopifyAPI('inventory_levels/adjust.json', 'POST', {
-      location_id: locationId,
-      inventory_item_id: inventoryItemId,
-      available_adjustment: -quantity // Negative to deduct
+    // Use inventory_levels/set to update available quantity
+    await shopifyAPI('inventory_levels/set.json', 'POST', {
+      location_id: details.locationId,
+      inventory_item_id: details.inventoryItemId,
+      available: available
     });
     
-    console.log(`✅ Successfully adjusted inventory for variant ${variantId}`);
+    console.log(`✅ Successfully set inventory for variant ${variantId} to ${available}`);
   } catch (error) {
-    console.error(`❌ Error adjusting inventory for variant ${variantId}:`, error.message);
+    console.error(`❌ Error setting inventory for variant ${variantId}:`, error.message);
   }
 }
 
 // ============================================
-// PROCESS BUNDLE ORDER
+// COMMIT STOCK (Reserve on order creation)
 // ============================================
-async function processBundleOrder(order) {
-  console.log(`\n📦 Processing order: ${order.name} (ID: ${order.id})`);
+async function commitStock(variantId, quantity, reason = '') {
+  try {
+    console.log(`🔒 Committing ${quantity} units of variant ${variantId} (${reason})`);
+    
+    const details = await getInventoryDetails(variantId);
+    if (!details) {
+      console.warn(`⚠️ No inventory location found for variant ${variantId}`);
+      return;
+    }
+    
+    // Reduce available quantity (commits the stock)
+    const newAvailable = Math.max(0, details.available - quantity);
+    
+    await shopifyAPI('inventory_levels/set.json', 'POST', {
+      location_id: details.locationId,
+      inventory_item_id: details.inventoryItemId,
+      available: newAvailable
+    });
+    
+    console.log(`✅ Committed ${quantity} units (${details.available} → ${newAvailable})`);
+  } catch (error) {
+    console.error(`❌ Error committing stock for variant ${variantId}:`, error.message);
+  }
+}
+
+// ============================================
+// RELEASE COMMITTED STOCK (On cancellation)
+// ============================================
+async function releaseStock(variantId, quantity, reason = '') {
+  try {
+    console.log(`🔓 Releasing ${quantity} units of variant ${variantId} (${reason})`);
+    
+    const details = await getInventoryDetails(variantId);
+    if (!details) {
+      console.warn(`⚠️ No inventory location found for variant ${variantId}`);
+      return;
+    }
+    
+    // Add back to available quantity
+    const newAvailable = details.available + quantity;
+    
+    await shopifyAPI('inventory_levels/set.json', 'POST', {
+      location_id: details.locationId,
+      inventory_item_id: details.inventoryItemId,
+      available: newAvailable
+    });
+    
+    console.log(`✅ Released ${quantity} units (${details.available} → ${newAvailable})`);
+  } catch (error) {
+    console.error(`❌ Error releasing stock for variant ${variantId}:`, error.message);
+  }
+}
+
+// ============================================
+// PARSE BUNDLE COMPONENTS
+// ============================================
+function parseBundleComponents(lineItem) {
+  const properties = lineItem.properties || [];
+  const componentsProperty = properties.find(p => p.name === '_clv_components');
+  
+  if (!componentsProperty) {
+    return null;
+  }
+  
+  try {
+    return JSON.parse(componentsProperty.value);
+  } catch (error) {
+    console.error('Error parsing bundle components:', error.message);
+    return null;
+  }
+}
+
+// ============================================
+// PROCESS ORDER CREATED (Commit Stock)
+// ============================================
+async function processOrderCreated(order) {
+  console.log(`\n📦 ORDER CREATED: ${order.name} (ID: ${order.id})`);
+  console.log(`💰 Financial Status: ${order.financial_status}`);
+  console.log(`📋 Fulfillment Status: ${order.fulfillment_status || 'unfulfilled'}`);
   
   for (const lineItem of order.line_items) {
-    // Check if this line item has our bundle components
-    const properties = lineItem.properties || [];
-    const componentsProperty = properties.find(p => p.name === '_clv_components');
+    const components = parseBundleComponents(lineItem);
+    if (!components) continue;
     
-    if (!componentsProperty) {
-      continue; // Not a bundle item, skip
+    console.log(`\n🎨 Found bundle: ${lineItem.title}`);
+    
+    // Commit cable stock
+    if (components.cable_variant_id) {
+      await commitStock(
+        components.cable_variant_id, 
+        lineItem.quantity,
+        `Cable from order ${order.name}`
+      );
     }
     
-    console.log(`\n🎨 Found bundle item: ${lineItem.title}`);
-    
-    try {
-      const components = JSON.parse(componentsProperty.value);
-      
-      // Deduct cable inventory
-      if (components.cable_variant_id) {
-        await adjustInventory(components.cable_variant_id, lineItem.quantity, 'Cable from bundle');
+    // Commit cotton ball stock
+    if (components.cotton && Array.isArray(components.cotton)) {
+      for (const cotton of components.cotton) {
+        const totalQty = cotton.qty * lineItem.quantity;
+        await commitStock(
+          cotton.variant_id,
+          totalQty,
+          `${cotton.title} from order ${order.name}`
+        );
       }
-      
-      // Deduct cotton ball inventory
-      if (components.cotton && Array.isArray(components.cotton)) {
-        for (const cotton of components.cotton) {
-          const totalQty = cotton.qty * lineItem.quantity; // Multiply by line item quantity
-          await adjustInventory(cotton.variant_id, totalQty, `Cotton ball: ${cotton.title}`);
-        }
-      }
-      
-      console.log(`✅ Bundle processed successfully`);
-    } catch (error) {
-      console.error(`❌ Error processing bundle:`, error.message);
     }
   }
+  
+  console.log(`\n✅ Stock committed for order ${order.name}`);
 }
 
 // ============================================
-// WEBHOOK ENDPOINT - ORDER CREATED
+// PROCESS ORDER FULFILLED (Stock already committed, just log)
 // ============================================
-app.post('/webhooks/orders/create', async (req, res) => {
-  console.log('\n🔔 Received order webhook');
+async function processOrderFulfilled(order) {
+  console.log(`\n📮 ORDER FULFILLED: ${order.name} (ID: ${order.id})`);
+  console.log(`✅ Stock was already committed when order was created`);
+  console.log(`📊 No additional inventory action needed`);
   
-  // Verify the webhook is from Shopify
+  // Note: Stock is already deducted from "available" when order was created
+  // Shopify automatically tracks this as "committed" inventory
+}
+
+// ============================================
+// PROCESS ORDER CANCELLED (Release Stock)
+// ============================================
+async function processOrderCancelled(order) {
+  console.log(`\n❌ ORDER CANCELLED: ${order.name} (ID: ${order.id})`);
+  console.log(`🔙 Releasing committed stock back to available`);
+  
+  for (const lineItem of order.line_items) {
+    const components = parseBundleComponents(lineItem);
+    if (!components) continue;
+    
+    console.log(`\n🎨 Releasing bundle: ${lineItem.title}`);
+    
+    // Release cable stock
+    if (components.cable_variant_id) {
+      await releaseStock(
+        components.cable_variant_id,
+        lineItem.quantity,
+        `Cancelled order ${order.name}`
+      );
+    }
+    
+    // Release cotton ball stock
+    if (components.cotton && Array.isArray(components.cotton)) {
+      for (const cotton of components.cotton) {
+        const totalQty = cotton.qty * lineItem.quantity;
+        await releaseStock(
+          cotton.variant_id,
+          totalQty,
+          `${cotton.title} from cancelled order ${order.name}`
+        );
+      }
+    }
+  }
+  
+  console.log(`\n✅ Stock released for cancelled order ${order.name}`);
+}
+
+// ============================================
+// WEBHOOK ENDPOINTS
+// ============================================
+
+// Order Created - Commit Stock
+app.post('/webhooks/orders/create', async (req, res) => {
+  console.log('\n🔔 Received ORDER CREATED webhook');
+  
   if (!verifyWebhook(req)) {
     console.error('❌ Webhook verification failed');
     return res.status(401).send('Unauthorized');
   }
   
-  // Respond immediately to Shopify (they expect quick response)
   res.status(200).send('OK');
   
-  // Process the order asynchronously
-  const order = req.body;
+  try {
+    await processOrderCreated(req.body);
+  } catch (error) {
+    console.error('❌ Error processing order creation:', error.message);
+  }
+});
+
+// Order Fulfilled - Log Only (stock already committed)
+app.post('/webhooks/orders/fulfilled', async (req, res) => {
+  console.log('\n🔔 Received ORDER FULFILLED webhook');
+  
+  if (!verifyWebhook(req)) {
+    console.error('❌ Webhook verification failed');
+    return res.status(401).send('Unauthorized');
+  }
+  
+  res.status(200).send('OK');
   
   try {
-    await processBundleOrder(order);
+    await processOrderFulfilled(req.body);
   } catch (error) {
-    console.error('❌ Error processing order:', error.message);
+    console.error('❌ Error processing order fulfillment:', error.message);
+  }
+});
+
+// Order Cancelled - Release Stock
+app.post('/webhooks/orders/cancelled', async (req, res) => {
+  console.log('\n🔔 Received ORDER CANCELLED webhook');
+  
+  if (!verifyWebhook(req)) {
+    console.error('❌ Webhook verification failed');
+    return res.status(401).send('Unauthorized');
+  }
+  
+  res.status(200).send('OK');
+  
+  try {
+    await processOrderCancelled(req.body);
+  } catch (error) {
+    console.error('❌ Error processing order cancellation:', error.message);
   }
 });
 
 // ============================================
-// HEALTH CHECK ENDPOINT
+// HEALTH CHECK
 // ============================================
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
-    message: 'Cable Lights Bundle Inventory Manager',
+    message: 'Cable Lights Bundle Inventory Manager (Committed Stock)',
     endpoints: {
-      webhook: '/webhooks/orders/create',
+      orderCreate: '/webhooks/orders/create',
+      orderFulfilled: '/webhooks/orders/fulfilled',
+      orderCancelled: '/webhooks/orders/cancelled',
       health: '/'
-    }
+    },
+    inventorySystem: 'committed-stock'
   });
-});
-
-// ============================================
-// CHECK INVENTORY ENDPOINT (Optional - for frontend)
-// ============================================
-app.get('/api/inventory/:variantId', async (req, res) => {
-  try {
-    const { variantId } = req.params;
-    
-    const variantData = await shopifyAPI(`variants/${variantId}.json`);
-    const inventoryItemId = variantData.variant.inventory_item_id;
-    
-    const levelsData = await shopifyAPI(`inventory_levels.json?inventory_item_ids=${inventoryItemId}`);
-    
-    const totalAvailable = levelsData.inventory_levels.reduce((sum, level) => {
-      return sum + (level.available || 0);
-    }, 0);
-    
-    res.json({
-      variant_id: variantId,
-      inventory_quantity: totalAvailable
-    });
-  } catch (error) {
-    console.error('Error checking inventory:', error.message);
-    res.status(500).json({ error: 'Failed to check inventory' });
-  }
 });
 
 // ============================================
@@ -215,10 +363,16 @@ app.get('/api/inventory/:variantId', async (req, res) => {
 // ============================================
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`📍 Webhook URL: http://localhost:${PORT}/webhooks/orders/create`);
+  console.log(`📍 Webhook URLs:`);
+  console.log(`   - Order Created: /webhooks/orders/create`);
+  console.log(`   - Order Fulfilled: /webhooks/orders/fulfilled`);
+  console.log(`   - Order Cancelled: /webhooks/orders/cancelled`);
   console.log(`\n⚙️  Configuration:`);
   console.log(`   Store: ${SHOPIFY_STORE}`);
   console.log(`   Token: ${SHOPIFY_ACCESS_TOKEN ? '✅ Set' : '❌ Not set'}`);
   console.log(`   Secret: ${SHOPIFY_WEBHOOK_SECRET ? '✅ Set' : '❌ Not set'}`);
-  console.log('\n💡 Make sure to configure webhooks in Shopify Admin\n');
+  console.log(`\n💡 Inventory System: Committed Stock`);
+  console.log(`   • Order Created → Commit (reserve) stock`);
+  console.log(`   • Order Fulfilled → Already committed`);
+  console.log(`   • Order Cancelled → Release stock\n`);
 });
