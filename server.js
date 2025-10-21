@@ -139,20 +139,32 @@ async function addStock(variantId, quantity, reason = '') {
 // ============================================
 // PARSE BUNDLE COMPONENTS
 // ============================================
-function parseBundleComponents(lineItem) {
+function parseBundleComponents(lineItem, order) {
+  // First try line item properties (for backwards compatibility)
   const properties = lineItem.properties || [];
   const componentsProperty = properties.find(p => p.name === '_clv_components');
   
-  if (!componentsProperty) {
-    return null;
+  if (componentsProperty) {
+    try {
+      return JSON.parse(componentsProperty.value);
+    } catch (error) {
+      console.error('Error parsing bundle components from properties:', error.message);
+    }
   }
   
-  try {
-    return JSON.parse(componentsProperty.value);
-  } catch (error) {
-    console.error('Error parsing bundle components:', error.message);
-    return null;
+  // If not in properties, try cart/order attributes
+  if (order && order.note_attributes) {
+    const componentAttr = order.note_attributes.find(attr => attr.name === '_clv_components');
+    if (componentAttr) {
+      try {
+        return JSON.parse(componentAttr.value);
+      } catch (error) {
+        console.error('Error parsing bundle components from attributes:', error.message);
+      }
+    }
   }
+  
+  return null;
 }
 
 // ============================================
